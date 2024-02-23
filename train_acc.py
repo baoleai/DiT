@@ -30,12 +30,11 @@ import os
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
-
+import torchacc as ta
 
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
-
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     """
@@ -61,14 +60,14 @@ def cleanup():
     """
     End DDP training.
     """
-    dist.destroy_process_group()
+    # dist.destroy_process_group()
 
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if True:  # real logger
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -111,18 +110,19 @@ def main(args):
     """
     Trains a new DiT model.
     """
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    # assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-
+    # dist.init_process_group("nccl")
+    # assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    # rank = dist.get_rank()
+    # # device = rank % torch.cuda.device_count()
+    # seed = args.global_seed * dist.get_world_size() + rank
+    # torch.manual_seed(seed)
+    # torch.cuda.set_device(device)
+    device = ta.lazy_device()
+    # print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    rank = 0
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -135,6 +135,7 @@ def main(args):
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
         logger = create_logger(None)
+
     logger.info = print
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -146,7 +147,9 @@ def main(args):
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+    # model = DDP(model.to(device), device_ids=[rank])
+    print(model)
+    model = model.to(device)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -164,24 +167,25 @@ def main(args):
     dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
-        num_replicas=dist.get_world_size(),
+        num_replicas=1,
         rank=rank,
         shuffle=True,
         seed=args.global_seed
     )
     loader = DataLoader(
         dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
+        batch_size=int(args.global_batch_size // 1),
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True
     )
+    loader = ta.AsyncLoader(loader, device)
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
@@ -195,56 +199,61 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            update_ema(ema, model.module)
+        with torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile'),
+            with_stack=False) as prof:
+            for x, y in loader:
+                # x = x.to(device)
+                # y = y.to(device)
+                with torch.no_grad():
+                    # Map input images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+                model_kwargs = dict(y=y)
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                update_ema(ema, model)
+                # prof.step()
 
-            # Log loss values:
-            running_loss += loss.item()
-            log_steps += 1
-            train_steps += 1
-            if train_steps % args.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                # Reset monitoring variables:
-                running_loss = 0
-                log_steps = 0
-                start_time = time()
+                # Log loss values:
+                running_loss += loss
+                log_steps += 1
+                train_steps += 1
+                if train_steps % args.log_every == 0:
+                    # Measure training speed:
+                    # torch.cuda.synchronize()
+                    end_time = time()
+                    steps_per_sec = log_steps / (end_time - start_time)
+                    # Reduce loss history over all processes:
+                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                    # dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss / 1
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                    # Reset monitoring variables:
+                    running_loss = 0
+                    log_steps = 0
+                    start_time = time()
 
-            # Save DiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                # # Save DiT checkpoint:
+                # if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                #     if rank == 0:
+                #         checkpoint = {
+                #             "model": model.module.state_dict(),
+                #             "ema": ema.state_dict(),
+                #             "opt": opt.state_dict(),
+                #             "args": args
+                #         }
+                #         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                #         torch.save(checkpoint, checkpoint_path)
+                #         logger.info(f"Saved checkpoint to {checkpoint_path}")
+                #     # dist.barrier()
 
-    model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+    # model.eval()  # important! This disables randomized embedding dropout
+    # # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
     cleanup()
