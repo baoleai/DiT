@@ -9,8 +9,8 @@ A minimal training script for DiT using PyTorch DDP.
 """
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -211,8 +211,9 @@ def main(args):
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
                 t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
                 model_kwargs = dict(y=y)
-                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-                loss = loss_dict["loss"].mean()
+                with torch.cuda.amp.autocast(cache_enabled=True, dtype=torch.bfloat16):
+                    loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                    loss = loss_dict["loss"].mean()
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -229,7 +230,7 @@ def main(args):
                     end_time = time()
                     steps_per_sec = log_steps / (end_time - start_time)
                     # Reduce loss history over all processes:
-                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                    avg_loss = running_loss / log_steps
                     # dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                     avg_loss = avg_loss / 1
                     logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")

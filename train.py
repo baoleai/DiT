@@ -203,8 +203,9 @@ def main(args):
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            with torch.cuda.amp.autocast(cache_enabled=True, dtype=torch.bfloat16):
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
