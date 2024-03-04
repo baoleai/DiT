@@ -17,6 +17,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
+
+from torch_xla.amp import syncfree
+
 import numpy as np
 from collections import OrderedDict
 from PIL import Image
@@ -155,7 +158,8 @@ def main(args):
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    found_inf = torch.tensor(0, dtype=torch.float, device=device)
+    opt = syncfree.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
@@ -216,7 +220,7 @@ def main(args):
                     loss = loss_dict["loss"].mean()
                 opt.zero_grad()
                 loss.backward()
-                opt.step()
+                opt.step(found_inf=found_inf)
                 update_ema(ema, model)
                 # prof.step()
 
