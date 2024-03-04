@@ -200,7 +200,7 @@ def main(args):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         with torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5),
+            schedule=torch.profiler.schedule(wait=2, warmup=2, active=4),
             on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile'),
             with_stack=False) as prof:
             for x, y in loader:

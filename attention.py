@@ -1,3 +1,4 @@
+import os
 import einops
 import torch
 import torch.nn as nn
@@ -23,8 +24,12 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.fused_attn = False
-        self.use_acc_flash_attn = True
+        if os.getenv("ACC_FLASH_ATTN", "0") == "1":
+            self.fused_attn = False
+            self.use_acc_flash_attn = True
+        else:
+            self.fused_attn = True
+            self.use_acc_flash_attn = False
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
